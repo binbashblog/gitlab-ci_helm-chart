@@ -1,0 +1,9 @@
+name: app
+apiVersion: v1
+appVersion: "1.0"
+version: "1.0"
+maintainers:
+    - name: John Doe
+      email: john.doe@example.com
+home: https://www.example.com/
+icon: https://www.example.com/assets/images/logo.png

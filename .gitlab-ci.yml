@@ -1,0 +1,274 @@
+#### DEFAULTS
+#image: xxxxxxxxxxxx.dkr.ecr.eu-west-1.amazonaws.com/devops_runner_rh:20250730
+services:
+  - docker:dind
+
+default:
+  tags:
+    - docker-k8s
+
+variables:
+  RELEASE: "$CI_COMMIT_BRANCH"
+  KUBECTL: "1.24.1"
+  RABBITMQ: "3.13.6-alpine-3.20.2-management"
+  POSTGRES: "15.12-alpine-3.21.3-patroni-4.0.5"
+  SCRIPT: "ubi8_20240821"
+  IBMMQ_TAG: "ibmcom-mq-9.2.4.0-r1"
+  KAFKA_TAG: "3.5.0"
+  KAFDROP: "3.31.0"
+  PROXY: "2.6.9-ubi-8"
+  NGINX: "1.26.3.1-ubi8"
+  PGWEB_TAG: "0.11.10-ubi-8"
+  MEMCACHED: "1.6.31-ubi-8"
+  APP: "no"
+  PGWEB: "no"
+  IBMMQ: "no"
+  KAFKA: "no"
+  TABLEAU: "no"
+  DOCKER_TLS_CERTDIR: ""
+
+stages:
+  - Docker
+  - Lint
+  - Deploy
+  - Uninstall
+  - Package
+
+Copy Docker Images to ECR:
+  stage: Docker
+  image: docker:24.0.5
+  tags:
+    - docker-k8s
+  services:
+    - name: docker:24.0.5-dind
+      command: ["--host=tcp://0.0.0.0:2375", "--tls=false"]
+  variables:
+    ACCOUNT1_ID: "XXXXXXXXXXXX"
+    ACCOUNT2_ID: "XXXXXXXXXXXX"
+    REGION1: "eu-west-1"
+    REGION2: "eu-west-2"
+    ROLE_NAME: "gitlab-runner-role"
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: "" 
+  before_script:
+    - apk add --no-cache bash aws-cli jq curl
+    - docker info
+  script:
+    - |
+      echo "Waiting for Docker to be ready..."
+      timeout 30 sh -c 'until curl -s http://docker:2375/_ping | grep -q OK; do sleep 1; done'
+
+    - |
+      bash <<'EOF'
+      set -euo pipefail
+
+      ROLE_NAME="${ROLE_NAME:-gitlab-runner-build-access}"
+
+      assume_role() {
+        local account_id=$1
+        local region=$2
+        local session_name="gitlab-session"
+        if [ -n "${CI_PIPELINE_ID:-}" ]; then
+          session_name="gitlab-${CI_PIPELINE_ID}"
+        fi
+
+        if [ "$account_id" = "760721461733" ]; then
+          echo "Native access to Account 1"
+          export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
+          export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
+          export AWS_SESSION_TOKEN="${AWS_SESSION_TOKEN:-}"
+        else
+          echo "Assuming role in account $account_id ($region)..."
+          creds=$(aws sts assume-role \
+            --role-arn "arn:aws:iam::$account_id:role/$ROLE_NAME" \
+            --role-session-name "$session_name")
+          export AWS_ACCESS_KEY_ID=$(echo "$creds" | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo "$creds" | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo "$creds" | jq -r '.Credentials.SessionToken')
+        fi
+        aws sts get-caller-identity
+      }
+
+      image_exists() {
+        local repo=$1
+        local tag=$2
+        AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID_2" \
+        AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY_2" \
+        AWS_SESSION_TOKEN="$AWS_SESSION_TOKEN_2" \
+        aws ecr describe-images \
+          --repository-name "$repo" \
+          --image-ids imageTag="$tag" \
+          --region "$REGION2" \
+          --query 'imageDetails' \
+          --output text 2>/dev/null | grep -q .
+      }
+
+      copy_image() {
+        local image_src="$1"
+        local tag_src="$2"
+        local tag_dst="$3"
+        local image_dst="${image_src//_/-}"
+
+        if image_exists "$image_dst" "$tag_dst"; then
+          echo "Skipping $image_dst:$tag_dst — already exists"
+        else
+          echo "Copying $image_src:$tag_src → $image_dst:$tag_dst"
+          AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID_1" \
+          AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY_1" \
+          AWS_SESSION_TOKEN="$AWS_SESSION_TOKEN_1" \
+          docker pull "$ACCOUNT1/$image_src:$tag_src"
+          docker tag "$ACCOUNT1/$image_src:$tag_src" "$ACCOUNT2/$image_dst:$tag_dst"
+          docker push "$ACCOUNT2/$image_dst:$tag_dst"
+          docker rmi "$ACCOUNT2/$image_dst:$tag_dst" "$ACCOUNT1/$image_src:$tag_src" || true
+        fi
+      }
+
+      # Assume Account1 and login to ECR
+      assume_role "$ACCOUNT1_ID" "$REGION1"
+      export ACCOUNT1="${ACCOUNT1_ID}.dkr.ecr.${REGION1}.amazonaws.com"
+      aws ecr get-login-password --region "$REGION1" | docker login -u AWS --password-stdin "https://$ACCOUNT1"
+
+      export AWS_ACCESS_KEY_ID_1=$AWS_ACCESS_KEY_ID
+      export AWS_SECRET_ACCESS_KEY_1=$AWS_SECRET_ACCESS_KEY
+      export AWS_SESSION_TOKEN_1=$AWS_SESSION_TOKEN
+
+      # Assume Account2 and login to ECR
+      assume_role "$ACCOUNT2_ID" "$REGION2"
+      export ACCOUNT2="${ACCOUNT2_ID}.dkr.ecr.${REGION2}.amazonaws.com"
+      aws ecr get-login-password --region "$REGION2" | docker login -u AWS --password-stdin "https://$ACCOUNT2"
+
+      export AWS_ACCESS_KEY_ID_2=$AWS_ACCESS_KEY_ID
+      export AWS_SECRET_ACCESS_KEY_2=$AWS_SECRET_ACCESS_KEY
+      export AWS_SESSION_TOKEN_2=$AWS_SESSION_TOKEN
+
+      # Main images
+      images=(
+        "generic-image"
+        "ui"
+      )
+      for image in "${images[@]}"; do
+        copy_image "$image" "$SOURCE1" "$TARGET"
+      done
+
+      # Secondary images
+      images2=(
+        "core-ui"
+        "core-api"
+      )
+      for image in "${images2[@]}"; do
+        copy_image "$image" "$SOURCE2" "$TARGET"
+      done
+
+      EOF
+  rules:
+    - if: '$CI_COMMIT_BRANCH != "main"'
+      when: manual
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: never
+
+Helm test:
+  tags:
+    - helm
+  stage: Lint
+  needs: ["Copy Docker Images to ECR"]
+  script:
+    - helm lint ./helm-chart
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: on_success
+    - changes: [helm-chart/*]
+      when: on_success
+
+Deploy Helm Chart:
+  tags:
+    - helm
+  stage: Deploy
+  needs: ["Helm test"]
+  script:
+    - |
+      SUFFIX=$(echo "$RELEASE" | sed 's/\.//g')
+      NAMESPACE="SUFFIX"
+      INGRESS="${NAMESPACE}.example.com"
+      echo "RELEASE=$RELEASE"
+      echo "SUFFIX=$SUFFIX"
+      echo "NAMESPACE=$NAMESPACE"
+      echo "INGRESS=$INGRESS"
+      curl "https://nexus.example.com/repository/artifacts/helm-charts/artifact.zip" --output artifact.zip
+      helm upgrade "$NAMESPACE" ./helm-chart \
+        --install \
+        --namespace "$NAMESPACE" \
+        --create-namespace \
+        --atomic \
+        --timeout 30m \
+        --set appVersion="$RELEASE" \
+        --set version="$RELEASE" \
+        --set release="$RELEASE" \
+        --set generic.container.tag="$RELEASE" \
+        --set postgres.container.tag="$POSTGRES" \
+        --set postgres.pgbackrest.container.tag="$KUBECTL" \
+        --set rabbitmq.container.tag="$RABBITMQ" \
+        --set ibmmq.container.tag="$IBMMQ_TAG" \
+        --set kafka.container.tag="$KAFKA_TAG" \
+        --set kafdrop.container.tag="$KAFDROP" \
+        --set ui.container.tag="$RELEASE" \
+        --set api.container.tag="$RELEASE" \
+        --set monitors.container.tag="$RELEASE" \
+        --set proxy.container.tag="$PROXY" \
+        --set cli.ref_data_load.container.tag="$KUBECTL" \
+        --set nginx.container.tag="$NGINX" \
+        --set ui.container.tag="$RELEASE" \
+        --set generator.container.tag="${RELEASE}_dev" \
+        --set pgweb.container.tag="$PGWEB_TAG" \
+        --set memcached.container.tag="$MEMCACHED" \
+        --set generator.enabled="$LOAD_GENERATOR" \
+        --set use_app="$APP" \
+        --set use_pgweb="$PGWEB" \
+        --set use_int_ibmmq="$IBMMQ" \
+        --set use_int_kafka="$KAFKA" \
+        --set use_int_tableau="$TABLEAU" \
+        --set ibmmq.ingress.hostname="ibmmq.$INGRESS" \
+        --set kafdrop.ingress.hostname="kafdrop.$INGRESS"
+  rules:
+    - changes: [helm-chart/*]
+      when: manual
+
+Helm uninstall:
+  tags:
+    - helm
+  stage: Uninstall
+  needs: ["Deploy Helm Chart"]
+  script:
+    - RELEASE_VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+    - echo "Using Kubernetes release $RELEASE_VERSION"
+    - curl -LO "https://dl.k8s.io/release/${RELEASE_VERSION}/bin/linux/amd64/kubectl"
+    - install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+    - |
+      SUFFIX=$(echo "$RELEASE" | sed 's/\.//g')
+      NAMESPACE="$SUFFIX"
+      helm uninstall "$NAMESPACE" --namespace "$NAMESPACE" || echo "Release $NAMESPACE not found"
+      kubectl delete namespace "$NAMESPACE" --ignore-not-found
+  rules:
+    - changes: [helm-chart/*]
+      when: manual
+
+Package:
+  tags:
+    - helm
+  stage: Package
+  needs: ["Helm test"]
+  script:
+    - |
+      apk add --no-cache git openssl zip
+      SUFFIX=$(echo "$RELEASE" | sed 's/\.//g')
+      ZIP_PASSWORD=$(openssl rand -base64 12)
+      echo "$ZIP_PASSWORD" > zip_password.txt
+      git ls-files --exclude-standard helm-chart/ | grep -v '\.gitignore$' | zip -@ -P "$ZIP_PASSWORD" "helm-chart-$SUFFIX.zip"
+
+  artifacts:
+    paths:
+      - chart.zip
+      - zip_password.txt
+    expire_in: 1w
+  rules:
+    - changes: [helm-chart/*]
+      when: manual
